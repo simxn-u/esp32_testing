@@ -9,5 +9,5 @@ idf_component_register(
                  "./Wifi"
                  "./Button"
                  "./Website"
-    REQUIRES led_strip esp_wifi esp_netif esp_event nvs_flash esp_http_server
+    REQUIRES led_strip esp_wifi esp_netif esp_event nvs_flash esp_http_client esp_http_server
 )

@@ -9,7 +9,7 @@ uint8_t ssid[] = { 's', 'i', 'm', 0xC3, 0xB8, 'n', '\0' };
 uint8_t password[] = "12345678";
 
 wifi_settings_t my_wifi = {
-    .mode = WIFI_CONFIG_MODE_STATIC,
+    .mode = WIFI_MODE_STATIC,
     .static_ip = "172.20.10.5",     
     .gateway = "172.20.10.1",        
     .netmask = "255.255.255.0",     
@@ -23,11 +23,33 @@ int app_main(void){
 
     RGB_Mode(check);
     vTaskDelay(pdMS_TO_TICKS(200));
-    RGB_Mode(pulse);
+    RGB_Mode(rainbow);
 
     strncpy(my_wifi.ssid, (char *)ssid, sizeof(my_wifi.ssid) - 1);
     strncpy(my_wifi.password, (char *)password, sizeof(my_wifi.password) - 1);
+    
+    wifi_init(&my_wifi);
 
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
+    bool switchMode = false;
+    do {
+        if (button_pressed()){
+            if (switchMode){
+                wifi_disconnect();
+                RGB_Mode(red);
+            }
+            else{
+                wifi_connect(&my_wifi);
+                RGB_Mode(green);
+            }
+            switchMode = !switchMode;
+            vTaskDelay(pdMS_TO_TICKS(1000));
+        }
+
+        vTaskDelay(pdMS_TO_TICKS(100));
+    } while (1);
+/*
     do {
         if (button_pressed()){
             RGB_Mode(flash_white);
@@ -54,6 +76,6 @@ int app_main(void){
         }
         vTaskDelay(pdMS_TO_TICKS(100));
     } while (1);
-    
+    */
     return 0;
 }

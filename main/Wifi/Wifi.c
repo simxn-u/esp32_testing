@@ -1,131 +1,180 @@
-#include "wifi.h"
+#include "Wifi.h"
+#include <stdio.h>
+#include <string.h>
 #include "esp_wifi.h"
 #include "esp_event.h"
-#include "esp_netif.h"
-#include "esp_http_server.h"
-#include "nvs_flash.h"
 #include "esp_log.h"
-#include "string.h"
+#include "nvs_flash.h"
+#include "esp_netif.h"
+#include "esp_system.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-#define WIFI_CONNECTED_BIT BIT0
-#define WIFI_FAIL_BIT      BIT1
+#include "esp_http_client.h"
+#include "esp_http_server.h"
 
-static EventGroupHandle_t wifi_event_group;
-static const char *TAG = "WiFi";
-static int retry_count = 0;
-static char ip_address[16] = "0.0.0.0";
-#define MAXIMUM_RETRY 5
+static const char *TAG = "wifi";
 
-static void event_handler(void *arg, esp_event_base_t event_base, int32_t event_id, void *event_data) {
-    if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_START) {
-        esp_wifi_connect();
-    } else if (event_base == WIFI_EVENT && event_id == WIFI_EVENT_STA_DISCONNECTED) {
-        if (retry_count < MAXIMUM_RETRY) {
-            esp_wifi_connect();
-            retry_count++;
-            ESP_LOGI(TAG, "Verbindung erneut versuchen (%d/%d)", retry_count, MAXIMUM_RETRY);
-        } else {
-            xEventGroupSetBits(wifi_event_group, WIFI_FAIL_BIT);
+#define API_KEY "cuuds91r01qlidi3enc0cuuds91r01qlidi3encg"
+char symbol[] = "NVDA";
+
+static int s_retry_num = 0;
+#define MAX_RETRY_QUICK 5
+
+static bool reconnect_enabled = true;
+
+static void wifi_event_handler(void* arg, esp_event_base_t event_base,
+                               int32_t event_id, void* event_data)
+{
+    if (event_base == WIFI_EVENT) {
+        switch (event_id) {
+            case WIFI_EVENT_STA_START:
+                ESP_LOGI(TAG, "WiFi started - initiating connection");
+                break;
+            case WIFI_EVENT_STA_DISCONNECTED:
+                if (!reconnect_enabled){
+                    ESP_LOGI(TAG, "Automatic reconnection disabled. No further connection attempts.");
+                    break;
+                }
+
+                ESP_LOGW(TAG, "WiFi connection lost - retrying...");
+                if (s_retry_num < MAX_RETRY_QUICK) {
+                    s_retry_num++;
+                    esp_wifi_connect();
+                } else {
+                    ESP_LOGW(TAG, "Maximum quick attempts reached, retrying in 10 seconds");
+                    esp_wifi_connect();
+                    vTaskDelay(pdMS_TO_TICKS(10000));
+                }
+                break;
+            case WIFI_EVENT_STA_CONNECTED:
+                ESP_LOGI(TAG, "Successfully connected to WiFi");
+                reconnect_enabled = true;
+                s_retry_num = 0;
+                break;
+            default:
+                break;
         }
-    } else if (event_base == IP_EVENT && event_id == IP_EVENT_STA_GOT_IP) {
-        ip_event_got_ip_t *event = (ip_event_got_ip_t *)event_data;
-        snprintf(ip_address, sizeof(ip_address), IPSTR, IP2STR(&event->ip_info.ip));
-        ESP_LOGI(TAG, "Verbunden mit IP: %s", ip_address);
-        retry_count = 0;
-        xEventGroupSetBits(wifi_event_group, WIFI_CONNECTED_BIT);
     }
 }
 
-esp_err_t wifi_init(const wifi_settings_t *config) {
+void wifi_init(const wifi_settings_t *settings) {
     ESP_ERROR_CHECK(nvs_flash_init());
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-    wifi_event_group = xEventGroupCreate();
     esp_netif_t *sta_netif = esp_netif_create_default_wifi_sta();
-
-    if (config->mode == WIFI_CONFIG_MODE_STATIC) {
-        esp_netif_ip_info_t ip_info;
-        esp_netif_str_to_ip4(config->static_ip, &ip_info.ip);
-        esp_netif_str_to_ip4(config->gateway, &ip_info.gw);
-        esp_netif_str_to_ip4(config->netmask, &ip_info.netmask);
-        ESP_ERROR_CHECK(esp_netif_dhcpc_stop(sta_netif));
-        ESP_ERROR_CHECK(esp_netif_set_ip_info(sta_netif, &ip_info));
-    }
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
 
-    esp_event_handler_instance_t instance_any_id;
-    esp_event_handler_instance_t instance_got_ip;
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, &event_handler, NULL, &instance_any_id));
-    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, &event_handler, NULL, &instance_got_ip));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT,
+                    ESP_EVENT_ANY_ID,
+                    &wifi_event_handler,
+                    NULL,
+                    NULL));
 
-    wifi_config_t wifi_cfg = {
-        .sta = {
-            .ssid = "",
-            .password = "",
-            .threshold.authmode = WIFI_AUTH_WPA2_PSK,
-        },
-    };
-    strncpy((char *)wifi_cfg.sta.ssid, config->ssid, sizeof(wifi_cfg.sta.ssid) - 1);
-    strncpy((char *)wifi_cfg.sta.password, config->password, sizeof(wifi_cfg.sta.password) - 1);
-
+    wifi_config_t wifi_config = {0};
+    strncpy((char *)wifi_config.sta.ssid, settings->ssid, sizeof(wifi_config.sta.ssid));
+    strncpy((char *)wifi_config.sta.password, settings->password, sizeof(wifi_config.sta.password));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
-    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_config(WIFI_IF_STA, &wifi_config));
+
+    if (settings->mode == WIFI_MODE_STATIC) {
+        esp_netif_ip_info_t ip_info;
+
+        ip4addr_aton(settings->static_ip, (ip4_addr_t *)&ip_info.ip);
+        ip4addr_aton(settings->gateway, (ip4_addr_t *)&ip_info.gw);
+        ip4addr_aton(settings->netmask, (ip4_addr_t *)&ip_info.netmask); 
+
+        esp_netif_dhcpc_stop(sta_netif);
+        esp_netif_set_ip_info(sta_netif, &ip_info);
+    }
+
     ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_LOGI(TAG, "WiFi initialized");
+}
 
-    ESP_LOGI(TAG, "WLAN wird gestartet...");
+void wifi_connect(const wifi_settings_t *settings) {
+    reconnect_enabled = true;
+    s_retry_num = 0;
+    ESP_LOGI(TAG, "Attempting connection to SSID: %s", settings->ssid);
+    esp_wifi_connect();
+}
 
-    EventBits_t bits = xEventGroupWaitBits(wifi_event_group, WIFI_CONNECTED_BIT | WIFI_FAIL_BIT, pdFALSE, pdFALSE, portMAX_DELAY);
-    if (bits & WIFI_CONNECTED_BIT) {
-        ESP_LOGI(TAG, "WLAN-Verbindung erfolgreich!");
-    } else if (bits & WIFI_FAIL_BIT) {
-        ESP_LOGI(TAG, "WLAN-Verbindung fehlgeschlagen!");
+void wifi_disconnect(void) {
+    reconnect_enabled = false;
+    esp_wifi_disconnect();
+    vTaskDelay(pdMS_TO_TICKS(200));
+    ESP_LOGI(TAG, "WiFi disconnected and automatic reconnection disabled.");
+}
+
+// HTTP-GET Handler zum Ausliefern der HTML-Datei
+static esp_err_t website_get_handler(httpd_req_t *req) {
+    // Der übergebene Kontext enthält den Pfad zur HTML-Datei
+    const char *html_path = (const char *)req->user_ctx;
+    FILE *file = fopen(html_path, "r");
+    if (!file) {
+        httpd_resp_send_err(req, HTTPD_500_INTERNAL_SERVER_ERROR, "Error opening the HTML file");
         return ESP_FAIL;
     }
 
-    return ESP_OK;
-}
-
-esp_err_t wifi_get_ip(char *result, size_t len) {
-    if (strlen(ip_address) > 0) {
-        strncpy(result, ip_address, len - 1);
-        result[len - 1] = '\0';
-        return ESP_OK;
+    char buffer[1024];
+    size_t nread;
+    httpd_resp_set_type(req, "text/html");
+    while ((nread = fread(buffer, 1, sizeof(buffer), file)) > 0) {
+        httpd_resp_send_chunk(req, buffer, nread);
     }
-    return ESP_FAIL;
-}
-
-static const char *html_page = "<h1>Standard HTML</h1>";  // Standardseite
-
-// Funktion zum Setzen einer neuen HTML-Seite
-void set_html_page(const char *html) {
-    html_page = html;
-    ESP_LOGI(TAG, "Neue HTML-Seite gesetzt!");
-}
-
-// HTTP GET-Handler, um HTML-Seite zu liefern
-esp_err_t get_handler(httpd_req_t *req) {
-    httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
+    fclose(file);
+    // Signalisieren, dass keine weiteren Daten folgen
+    httpd_resp_send_chunk(req, NULL, 0);
     return ESP_OK;
 }
 
-// Webserver starten
-esp_err_t start_webserver() {
-    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+void wifi_serve_website(const char *html_file_path) {
     httpd_handle_t server = NULL;
+    httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+
+    // URI-Handler für die Startseite
+    httpd_uri_t uri_get = {
+        .uri      = "/",
+        .method   = HTTP_GET,
+        .handler  = website_get_handler,
+        .user_ctx = (void *)html_file_path
+    };
 
     if (httpd_start(&server, &config) == ESP_OK) {
-        httpd_uri_t page_uri = {
-            .uri = "/",
-            .method = HTTP_GET,
-            .handler = get_handler,
-            .user_ctx = NULL
-        };
-        httpd_register_uri_handler(server, &page_uri);
+        httpd_register_uri_handler(server, &uri_get);
+        ESP_LOGI(TAG, "HTTP server started - website available at the static IP");
+    } else {
+        ESP_LOGE(TAG, "Error starting the HTTP server");
     }
+}
 
-    ESP_LOGI(TAG, "Webserver gestartet!");
-    return ESP_OK;
+bool wifi_fetch_api(const char *url, char *response_buffer, size_t buffer_size) {
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_GET,
+        .timeout_ms = 5000,
+    };
+    esp_http_client_handle_t client = esp_http_client_init(&config);
+    if (client == NULL) {
+        ESP_LOGE(TAG, "HTTP connection could not be initialized");
+        return false;
+    }
+    esp_err_t err = esp_http_client_perform(client);
+    if (err == ESP_OK) {
+        int read_len = esp_http_client_read_response(client, response_buffer, buffer_size);
+        if (read_len >= 0) {
+            // Abschließen der Zeichenkette
+            response_buffer[read_len] = 0;
+            ESP_LOGI(TAG, "API-Antwort erhalten (Statuscode: %d)",
+                     esp_http_client_get_status_code(client));
+            esp_http_client_cleanup(client);
+            return true;
+        }
+    }
+    ESP_LOGE(TAG, "Fehler bei der API-Anfrage: %s", esp_err_to_name(err));
+    esp_http_client_cleanup(client);
+    return false;
 }
